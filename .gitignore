@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+rlm/rlm_summarizer.py
+1_technice.md
+AGENTS.md
+extract-abstract.ipynb
+outputs/summary.md

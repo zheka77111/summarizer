@@ -99,3 +99,54 @@ from src.tools import (
 3. Убедиться, что есть `text.md`.
 4. Открыть и запустить `суммаризация.ipynb` по ячейкам.
 
+## Автоклассификация и автовыбор стратегии
+
+В `src/tools.py` добавлены инструменты:
+
+- `classify_document_type` — LLM-классификатор типа документа.
+- `auto_summarize_by_doc_type` — автоклассификация + автоматический выбор стратегии суммаризации.
+
+Поддерживаемые типы документа:
+
+- `business_report`
+- `research_article`
+- `technical_documentation`
+- `policy_or_regulation`
+- `educational_or_book`
+- `interview_or_meeting`
+- `news_or_article`
+- `narrative`
+- `mixed_or_other`
+
+Маппинг типа в стратегию:
+
+- `business_report` -> `chain_of_density`
+- `research_article` -> `two_stage`
+- `technical_documentation` -> `controlled_abstraction`
+- `policy_or_regulation` -> `controlled_abstraction`
+- `educational_or_book` -> `multi_vector`
+- `interview_or_meeting` -> `multi_vector`
+- `news_or_article` -> `two_stage`
+- `narrative` -> `multi_vector`
+- `mixed_or_other` -> `two_stage`
+
+Для больших текстов классификатор автоматически делит текст на чанки, классифицирует чанки и агрегирует итоговый тип.
+
+Пример использования:
+
+```python
+from src.tools import auto_summarize_by_doc_type
+
+result = auto_summarize_by_doc_type.invoke({
+    "text": text,
+    "large_doc_threshold": 14000,
+    "classification_chunk_size": 12000,
+    "classification_chunk_overlap": 400,
+    "classification_max_chunks": 8,
+    "chunk_size": 12000,
+    "chunk_overlap": 800,
+    "max_levels": 4,
+    "include_debug": False,
+})
+print(result)
+```

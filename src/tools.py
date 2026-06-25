@@ -1,4 +1,6 @@
 from typing import List
+import json
+from collections import Counter
 
 from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import tool
@@ -565,6 +567,238 @@ def large_document_summarize(
         )
 
     return final_summary + '\n\n' + '\n'.join(debug_lines)
+
+
+DocumentTypeLiteral = Literal[
+    'business_report',
+    'research_article',
+    'technical_documentation',
+    'policy_or_regulation',
+    'educational_or_book',
+    'interview_or_meeting',
+    'news_or_article',
+    'narrative',
+    'mixed_or_other',
+]
+
+
+DOC_TYPE_TO_STRATEGY: dict[str, str] = {
+    'business_report': 'chain_of_density',
+    'research_article': 'two_stage',
+    'technical_documentation': 'controlled_abstraction',
+    'policy_or_regulation': 'controlled_abstraction',
+    'educational_or_book': 'multi_vector',
+    'interview_or_meeting': 'multi_vector',
+    'news_or_article': 'two_stage',
+    'narrative': 'multi_vector',
+    'mixed_or_other': 'two_stage',
+}
+
+
+class DocTypeSchema(BaseModel):
+    doc_type: DocumentTypeLiteral
+    confidence: int = Field(..., ge=0, le=100)
+    rationale: str = Field(..., description='Короткое объяснение, почему выбран этот тип')
+
+
+doc_type_parser = JsonOutputParser(pydantic_object=DocTypeSchema)
+
+
+DOC_TYPE_PROMPT = PromptTemplate.from_template("""
+Ты классифицируешь тип документа для выбора стратегии суммаризации.
+
+Категории:
+- business_report: бизнес-отчет, performance-отчет, квартальный обзор, KPI/метрики
+- research_article: научная или аналитическая статья с гипотезами/методами/выводами
+- technical_documentation: техдок, RFC, API/архитектурная документация, руководство
+- policy_or_regulation: политика, регламент, стандарт, комплаенс-требования
+- educational_or_book: учебный текст, книга, курс, методичка
+- interview_or_meeting: интервью, стенограмма встречи, Q&A
+- news_or_article: новость, журналистская статья, обзор события
+- narrative: повествовательный/эссеистический текст
+- mixed_or_other: смешанный или трудноопределимый тип
+
+Текст:
+{text}
+
+Верни строго JSON:
+{format_instructions}
+""")
+
+
+DOC_TYPE_AGG_PROMPT = PromptTemplate.from_template("""
+Ты агрегируешь классификации чанков длинного документа в один итоговый тип.
+
+Классификации чанков (JSON-массив):
+{chunk_classifications}
+
+Правила:
+- Если есть явное преобладание одного типа, выбери его.
+- Если документ явно смешанный, выбери mixed_or_other.
+- confidence = 0..100.
+- rationale: 1-2 предложения, с учетом распределения по чанкам.
+
+Верни строго JSON:
+{format_instructions}
+""")
+
+
+def _classify_single_text(text: str) -> dict:
+    classify_chain = DOC_TYPE_PROMPT | llm | doc_type_parser
+    return classify_chain.invoke(
+        {
+            'text': text,
+            'format_instructions': doc_type_parser.get_format_instructions(),
+        }
+    )
+
+
+def classify_document_type(
+    text: str,
+    *,
+    chunk_size: int = 12000,
+    chunk_overlap: int = 400,
+    max_chunks: int = 8,
+) -> dict:
+    """Классификация типа документа с поддержкой длинных текстов через чанки и агрегацию."""
+    clean_text = text.strip()
+    if not clean_text:
+        return {
+            'doc_type': 'mixed_or_other',
+            'confidence': 0,
+            'rationale': 'Пустой текст',
+            'is_large_document': False,
+            'analyzed_chunks': 0,
+            'strategy': DOC_TYPE_TO_STRATEGY['mixed_or_other'],
+        }
+
+    if len(clean_text) <= chunk_size:
+        result = _classify_single_text(clean_text)
+        result['is_large_document'] = False
+        result['analyzed_chunks'] = 1
+        result['strategy'] = DOC_TYPE_TO_STRATEGY.get(result['doc_type'], 'two_stage')
+        return result
+
+    chunks = split_long_text(clean_text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    sampled_chunks = chunks[:max_chunks]
+
+    chunk_results: list[dict] = []
+    for chunk in sampled_chunks:
+        chunk_results.append(_classify_single_text(chunk))
+
+    agg_chain = DOC_TYPE_AGG_PROMPT | llm | doc_type_parser
+    try:
+        aggregated = agg_chain.invoke(
+            {
+                'chunk_classifications': json.dumps(chunk_results, ensure_ascii=False),
+                'format_instructions': doc_type_parser.get_format_instructions(),
+            }
+        )
+    except Exception:
+        votes = [item['doc_type'] for item in chunk_results]
+        majority = Counter(votes).most_common(1)[0][0]
+        aggregated = {
+            'doc_type': majority,
+            'confidence': 60,
+            'rationale': 'Fallback по мажоритарному голосованию чанков.',
+        }
+
+    aggregated['is_large_document'] = True
+    aggregated['analyzed_chunks'] = len(sampled_chunks)
+    aggregated['total_chunks'] = len(chunks)
+    aggregated['strategy'] = DOC_TYPE_TO_STRATEGY.get(aggregated['doc_type'], 'two_stage')
+    return aggregated
+
+
+class DocumentTypeClassifierInput(BaseModel):
+    text: str = Field(..., description='Исходный текст для классификации')
+    chunk_size: int = Field(default=12000, ge=1000, description='Размер чанка для длинных документов')
+    chunk_overlap: int = Field(default=400, ge=0, description='Перекрытие чанков')
+    max_chunks: int = Field(default=8, ge=1, le=20, description='Максимум чанков для анализа')
+
+
+@tool('classify_document_type', args_schema=DocumentTypeClassifierInput)
+def classify_document_type_tool(
+    text: str,
+    chunk_size: int = 12000,
+    chunk_overlap: int = 400,
+    max_chunks: int = 8,
+) -> str:
+    """LLM-классификатор типа документа (поддерживает большие документы через чанки)."""
+    result = classify_document_type(
+        text=text,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        max_chunks=max_chunks,
+    )
+    return (
+        '## Классификация документа\n'
+        f"- doc_type: {result['doc_type']}\n"
+        f"- confidence: {result['confidence']}\n"
+        f"- strategy: {result['strategy']}\n"
+        f"- is_large_document: {result['is_large_document']}\n"
+        f"- analyzed_chunks: {result['analyzed_chunks']}\n"
+        f"- rationale: {result['rationale']}\n"
+    )
+
+
+class AutoSummarizeByDocTypeInput(BaseModel):
+    text: str = Field(..., description='Текст для автоклассификации и суммаризации')
+    large_doc_threshold: int = Field(default=14000, ge=1000, description='Порог длины для large_document_summarize')
+    classification_chunk_size: int = Field(default=12000, ge=1000, description='Размер чанка классификатора')
+    classification_chunk_overlap: int = Field(default=400, ge=0, description='Перекрытие чанков классификатора')
+    classification_max_chunks: int = Field(default=8, ge=1, le=20, description='Максимум чанков классификатора')
+    chunk_size: int = Field(default=12000, ge=1000, description='Размер чанка для large_document_summarize')
+    chunk_overlap: int = Field(default=800, ge=0, description='Перекрытие для large_document_summarize')
+    max_levels: int = Field(default=4, ge=1, le=10, description='Глубина рекурсивного merge')
+    include_debug: bool = Field(default=False, description='Добавить debug-статистику уровней')
+
+
+@tool('auto_summarize_by_doc_type', args_schema=AutoSummarizeByDocTypeInput)
+def auto_summarize_by_doc_type(
+    text: str,
+    large_doc_threshold: int = 14000,
+    classification_chunk_size: int = 12000,
+    classification_chunk_overlap: int = 400,
+    classification_max_chunks: int = 8,
+    chunk_size: int = 12000,
+    chunk_overlap: int = 800,
+    max_levels: int = 4,
+    include_debug: bool = False,
+) -> str:
+    """Автовыбор стратегии суммаризации на основе LLM-классификации типа документа."""
+    cls = classify_document_type(
+        text=text,
+        chunk_size=classification_chunk_size,
+        chunk_overlap=classification_chunk_overlap,
+        max_chunks=classification_max_chunks,
+    )
+    strategy = cls['strategy']
+    print(f"Auto-selected strategy: {strategy} for doc_type: {cls['doc_type']} (confidence: {cls['confidence']})")
+    clean_text = text.strip()
+    if len(clean_text) > large_doc_threshold:
+        summary = large_document_summarize.invoke(
+            {
+                'text': clean_text,
+                'strategy': strategy,
+                'chunk_size': chunk_size,
+                'chunk_overlap': chunk_overlap,
+                'max_levels': max_levels,
+                'include_debug': include_debug,
+            }
+        )
+    else:
+        summary = _invoke_base_tool(strategy, clean_text)
+
+    return (
+        '## Auto Strategy Selection\n'
+        f"- doc_type: {cls['doc_type']}\n"
+        f"- confidence: {cls['confidence']}\n"
+        f"- strategy: {strategy}\n"
+        f"- rationale: {cls['rationale']}\n\n"
+        '## Summary\n'
+        f'{summary}'
+    )
 
 
 # Пример:
